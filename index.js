@@ -1,4 +1,4 @@
-const firebaseAdmin = require("firebase-admin");
+const Database = require("better-sqlite3");
 const { Client, Intents, MessageActionRow, MessageSelectMenu, MessageEmbed } = require("discord.js");
 const timezones = require("./timezones.json");
 const localeSettings = require("./locales.json");
@@ -10,32 +10,15 @@ const localePrefix = "timelyLocale";
 
 const setupMessage = "Please configure your time zone and locale settings with the dropdowns below.  Your settings will be used across all servers that use Timely, so you will only ever have to do this once!";
 
-let database = null;
+// Initialize SQLite database
+const db = new Database("timely.db");
+db.prepare("CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, timezone TEXT, dst TEXT)").run();
 
 // Create a new client instance
 const client = new Client({ intents: [Intents.FLAGS.GUILDS, Intents.FLAGS.GUILD_MESSAGES] });
 
 client.once('ready', () => {
-	firebaseAdmin.initializeApp({
-		credential: firebaseAdmin.credential.cert({
-			type: "service_account",
-			project_id: "timekeeper-bot",
-			private_key_id: process.env.SA_PRIVATE_KEY_ID,
-			private_key: process.env.SA_PRIVATE_KEY.replace(/\\n/gm, "\n"),
-			client_email: process.env.SA_CLIENT_EMAIL,
-			client_id: process.env.SA_CLIENT_ID,
-			auth_uri: "https://accounts.google.com/o/oauth2/auth",
-			token_uri: "https://oauth2.googleapis.com/token",
-			auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-			client_x509_cert_url: "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-pln7w%40timekeeper-bot.iam.gserviceaccount.com"
-		}),
-		databaseURL:"https://timekeeper-bot-default-rtdb.firebaseio.com" 
-	});
-
-	database = firebaseAdmin.database();
-
 	setStatus();
-
 	console.log("Running!");
 });
 
@@ -46,7 +29,7 @@ client.on("interactionCreate", async interaction => {
 	if (interaction.commandName === "timely") {
 		let rows = [];
 
-		const userTZ = (await getUserInfo(interaction.user.id) || {});
+		const userTZ = getUserInfo(interaction.user.id);
 
 		rows.push(new MessageActionRow()
 		.addComponents(
@@ -88,12 +71,12 @@ client.on("interactionCreate", async interaction => {
 			switch (interactionData[0]) {
 				case timezonePrefix:
 					let tzValue = interactionData[1];
-					await database.ref("users/" + interaction.user.id + "/timezone").set(tzValue);
+					db.prepare("INSERT INTO users (user_id, timezone) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET timezone = excluded.timezone").run(interaction.user.id, tzValue);
 					await interaction.reply({ content: "Timezone set to `" + timezones.find(tz => tz.value === tzValue).label + "`\n\nTimely will now reply to any of your posts containing times and convert them into Discord timestamps.", ephemeral: true })
 					break;
 				case localePrefix:
 					let localeValue = interactionData[1];
-					await database.ref("users/" + interaction.user.id + "/dst").set(localeValue);
+					db.prepare("INSERT INTO users (user_id, dst) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET dst = excluded.dst").run(interaction.user.id, localeValue);
 					await interaction.reply({ content: "Locale settings changed to `" + localeValue + "`", ephemeral: true });
 					break;
 				default:
@@ -115,7 +98,7 @@ client.on("messageCreate", async message => {
 		// Keep going if we found any times.
 		if (finds?.length) {
 			const results = [];
-			const userTZ = await getUserInfo(message.author.id);
+			const userTZ = getUserInfo(message.author.id);
 
 			// Shift the times to UTC.
 			finds.forEach(time => {
@@ -149,25 +132,25 @@ client.on("messageCreate", async message => {
 });
 
 // Pull user entry from the database.
-const getUserInfo = async (userId) => {
-	return await database.ref("users/" + userId).once("value").then((result) => {
-		return result.val() || {};
-	});
-}
+const getUserInfo = (userId) => {
+	return db.prepare("SELECT timezone, dst FROM users WHERE user_id = ?").get(userId) || {};
+};
 
 // Use locale data to figure out a date (last Sunday in March, first Sunday in October, and so on)
 const calculateDate = (dateInfo) => {
 	let result = new Date();
 	result.setUTCHours(0, 0, 0, 0);
-	let maxDays = new Date(result.getUTCFullYear(), dateInfo.month, 0).getDate();
+	// Use month + 1 with day 0 to correctly get the last day of the target month.
+	let maxDays = new Date(Date.UTC(result.getUTCFullYear(), dateInfo.month + 1, 0)).getUTCDate();
 	let curDay = 0;
 	let dayHits = 0;
 
 	// Positive dayCount -> count from the beginning of the month.
 	if (dateInfo.dayCount > 0) {
-		result.setUTCMonth(dateInfo.month);
+		// Set month and day together to avoid day-of-month overflow (e.g. Jan 31 -> Feb 31).
+		result.setUTCMonth(dateInfo.month, 1);
 
-		for (curDay = 1; curDay < maxDays; curDay++) {
+		for (curDay = 1; curDay <= maxDays; curDay++) {
 			result.setUTCDate(curDay);
 
 			if (result.getUTCDay() === dateInfo.weekday) {
@@ -178,7 +161,7 @@ const calculateDate = (dateInfo) => {
 		}
 	// Negative dayCount -> count from the end of the month.
 	} else if (dateInfo.dayCount < 0) {
-		result.setUTCMonth(dateInfo.month);
+		result.setUTCMonth(dateInfo.month, 1);
 
 		for (curDay = maxDays; curDay >= 1; curDay--) {
 			result.setUTCDate(curDay);
@@ -212,9 +195,10 @@ const convertTime = (time, tzInfo) => {
 		if (localeSetting.starts.month < 0) {
 			dstMinutes = 60 * localeSetting.offset;
 		} else {
-			// Convert current time to UTC
+			// Convert current UTC time to the user's local time for DST boundary comparison.
+			// Adding the offset (which is negative for western timezones) shifts UTC back to local time.
 			let checkTime = new Date();
-			checkTime.setUTCHours(checkTime.getUTCHours() - offset);
+			checkTime.setUTCHours(checkTime.getUTCHours() + offset);
 
 			let startTime = calculateDate(localeSetting.starts);
 			let endTime = calculateDate(localeSetting.ends);
@@ -260,7 +244,7 @@ const convertTime = (time, tzInfo) => {
 	time = time.replace(/^([0-9:.]+).*$/, "$1");
 
 	let splits;
-	
+
 	if (time.indexOf(":") > -1) {
 		splits = time.split(":");
 	}
@@ -291,7 +275,6 @@ const convertTime = (time, tzInfo) => {
 const setStatus = () => {
 	const guildCount = client.guilds.cache.size;
 	client.user.setActivity({ name:`Keeping time on ${guildCount} servers` });
-	database.ref("status/serverCount").set(guildCount);
 }
 
 // Log the bot into Discord.
